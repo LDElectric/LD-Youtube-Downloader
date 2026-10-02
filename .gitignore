@@ -1,0 +1,11 @@
+build/
+dist/
+__pycache__/
+*.spec
+LD_Youtube_Downloader_new.py
+refactor.py
+refactor2.py
+.youtube_downloader_config.json
+.youtube_downloader_history.json
+*.pyc
+*.pyo
