@@ -255,19 +255,24 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         self.download_path = self.app_config.get("last_dir", str(Path.home() / "Downloads"))
         self.ffmpeg_location = find_ffmpeg(self.app_config)
 
-        self.is_downloading = False
-        self.cancel_event = threading.Event()
-        self.current_file = None
-        self.overwrite = False
-        self._mode = "video"
-        self._quality = VIDEO_QUALITIES[0]
-        self._target_dir = self.download_path
-        self._pending_items = None
-        self._last_hook_ui = 0.0
+        # Downloads simultâneos: cada job tem seu próprio contexto
+        self._active_jobs = {}   # job_id -> dict com estado do job
+        self._next_job_id = 0
+        self._pending_items = None   # usado apenas na fase de análise/ffmpeg
         self._last_url = ""
         self._download_started = False
         self.history_widgets = []
         self._ui_queue = queue.Queue()
+
+        # Modo padrão (pode ser restaurado do config abaixo)
+        saved_mode = self.app_config.get("last_mode", "video")
+        self._mode = saved_mode if saved_mode in ("audio", "video") else "video"
+        saved_vq = self.app_config.get("last_quality_video", VIDEO_QUALITIES[0])
+        saved_aq = self.app_config.get("last_quality_audio", AUDIO_QUALITIES[0])
+        self._quality_init = {
+            "video": saved_vq if saved_vq in VIDEO_QUALITIES else VIDEO_QUALITIES[0],
+            "audio": saved_aq if saved_aq in AUDIO_QUALITIES else AUDIO_QUALITIES[0],
+        }
 
         # Player state
         self._player_state = "stopped"
@@ -286,6 +291,9 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         self.create_widgets()
         self.update_path_label()
         self.render_history()
+
+        # Restaura modo e qualidade salvos
+        self._restore_mode()
 
         self.center_on_screen()
 
@@ -435,6 +443,7 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
 
         self.download_type = ctk.StringVar(value="video")
         self.mode_label = ctk.StringVar(value="Vídeo")
+        # _quality_choice é inicializado com valores padrão; _restore_mode() aplica os salvos
         self._quality_choice = {"video": VIDEO_QUALITIES[0], "audio": AUDIO_QUALITIES[0]}
         self.segment = ctk.CTkSegmentedButton(
             opts_inner, values=["Vídeo", "Áudio (MP3)"],
@@ -454,6 +463,8 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             dropdown_fg_color=C_CARD, dropdown_hover_color=C_HOVER, dropdown_text_color=C_TEXT)
         self.quality_menu.set(VIDEO_QUALITIES[0])
         self.quality_menu.pack(side="left")
+        # Cancel btn permanece sem job_id pois cancela todos no contexto atual
+        # (mantido por compatibilidade; se houver múltiplos jobs a UI indica por widget)
         self.cancel_btn = ctk.CTkButton(
             opts_inner, text="✕  Cancelar", width=100, height=28, corner_radius=5,
             fg_color="transparent", border_width=1, border_color=C_BORDER,
@@ -744,7 +755,10 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
                             text_color=C_FAINT, anchor="w")
 
     def set_download_button(self, text, disabled=False):
-        """Atualiza texto/estado do botão principal mantendo o estilo."""
+        """Atualiza texto/estado do botão principal.
+        Com downloads simultâneos, o botão fica sempre habilitado
+        a menos que esteja em fase de análise de link.
+        """
         self.download_btn.configure(
             text=text, state="disabled" if disabled else "normal",
             fg_color=C_ACCENT_DIM if disabled else C_ACCENT)
@@ -881,6 +895,16 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
     def set_status(self, text):
         self.status_label.configure(text=text)
 
+    def _restore_mode(self):
+        """Restaura modo e qualidade salvos no config após create_widgets()."""
+        init = getattr(self, "_quality_init", {})
+        self._quality_choice["video"] = init.get("video", VIDEO_QUALITIES[0])
+        self._quality_choice["audio"] = init.get("audio", AUDIO_QUALITIES[0])
+        mode = self._mode
+        self.download_type.set(mode)
+        self.mode_label.set("Áudio (MP3)" if mode == "audio" else "Vídeo")
+        self.refresh_quality_menu()
+
     def _on_mode_change(self, value):
         """Chamado pelo segmented button: 'Vídeo' ou 'Áudio (MP3)'."""
         # guarda a qualidade escolhida no modo anterior
@@ -894,9 +918,17 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         self.refresh_quality_menu()
         self._quality = self.quality_menu.get()
 
+        # Persiste a escolha do usuário
+        self.app_config["last_mode"] = mode
+        save_config(self.app_config)
+
     def _on_quality_change(self, value):
-        """Mantém a cópia simples da qualidade atualizada (thread-safe)."""
+        """Mantém a cópia simples da qualidade atualizada e salva no config."""
         self._quality = value
+        mode = self.download_type.get()
+        key = "last_quality_audio" if mode == "audio" else "last_quality_video"
+        self.app_config[key] = value
+        save_config(self.app_config)
 
     def refresh_quality_menu(self):
         if self.download_type.get() == "audio":
@@ -913,9 +945,6 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             )
 
     def choose_directory(self):
-        if self.is_downloading:
-            messagebox.showinfo("Aguarde", "Aguarde o download atual terminar para mudar a pasta.", parent=self)
-            return
         path = filedialog.askdirectory(initialdir=self.download_path, parent=self)
         if path:
             self.download_path = path
@@ -1066,7 +1095,8 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             
         self._player_load_and_play(filepath)
 
-    def add_active_download(self, title, kind):
+    def add_active_download(self, job_id, title, kind):
+        """Cria widget de progresso para um job específico no histórico."""
         if getattr(self, "empty_label", None) is not None:
             try:
                 self.empty_label.destroy()
@@ -1075,7 +1105,7 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             self.empty_label = None
 
         item = ctk.CTkFrame(self.history_frame, corner_radius=0, fg_color=C_SURFACE, border_width=0)
-        
+
         display = title if len(title) <= 65 else title[:62] + "..."
         badge = "MP3" if kind == "audio" else "MP4"
         badge_color = "#5B8DD9" if kind == "video" else C_ACCENT
@@ -1090,6 +1120,16 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         )
         badge_lbl.pack(side="left", padx=(0, 10))
 
+        # Botão cancelar job individual
+        cancel_btn = ctk.CTkButton(
+            inner, text="✕", width=26, height=26,
+            corner_radius=5, fg_color="transparent",
+            border_width=0, text_color=C_DANGER, hover_color=C_DANGER_HOVER,
+            font=ctk.CTkFont(size=12),
+            command=lambda jid=job_id: self._cancel_job(jid)
+        )
+        cancel_btn.pack(side="right")
+
         text_col = ctk.CTkFrame(inner, fg_color="transparent")
         text_col.pack(side="left", fill="x", expand=True)
 
@@ -1098,18 +1138,18 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             text_color=C_TEXT, anchor="w"
         ).pack(fill="x")
 
-        self._active_dl_status = ctk.CTkLabel(
+        status_lbl = ctk.CTkLabel(
             text_col, text="Iniciando...", font=ctk.CTkFont(size=10),
             text_color=C_FAINT, anchor="w"
         )
-        self._active_dl_status.pack(fill="x")
-        
-        self._active_dl_progress = ctk.CTkProgressBar(
+        status_lbl.pack(fill="x")
+
+        progress_bar = ctk.CTkProgressBar(
             text_col, height=4, corner_radius=2,
             fg_color=C_BORDER, progress_color=C_ACCENT
         )
-        self._active_dl_progress.pack(fill="x", pady=(4, 0))
-        self._active_dl_progress.set(0)
+        progress_bar.pack(fill="x", pady=(4, 0))
+        progress_bar.set(0)
 
         ctk.CTkFrame(item, height=1, fg_color=C_BORDER_SOFT, corner_radius=0).pack(fill="x")
 
@@ -1117,24 +1157,29 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
             item.pack(fill="x", padx=0, pady=0, before=self.history_widgets[0])
         else:
             item.pack(fill="x", padx=0, pady=0)
-        
-        self._active_dl_frame = item
-        
+
+        # Guarda referências no job
+        if job_id in self._active_jobs:
+            self._active_jobs[job_id]["frame"] = item
+            self._active_jobs[job_id]["status_lbl"] = status_lbl
+            self._active_jobs[job_id]["progress_bar"] = progress_bar
+
         try:
             canvas = self.history_frame._parent_canvas
             canvas.yview_moveto(0)
         except Exception:
             pass
 
-    def remove_active_download(self):
-        if getattr(self, "_active_dl_frame", None):
+    def remove_active_download(self, job_id):
+        """Remove o widget de progresso de um job específico."""
+        job = self._active_jobs.get(job_id, {})
+        frame = job.get("frame")
+        if frame:
             try:
-                self._active_dl_frame.destroy()
+                frame.destroy()
             except Exception:
                 pass
-            self._active_dl_frame = None
-            self._active_dl_progress = None
-            self._active_dl_status = None
+        self._active_jobs.pop(job_id, None)
 
     def add_history_item(self, entry):
         self.history.insert(0, entry)
@@ -1191,26 +1236,46 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         self.set_status("Histórico limpo")
 
     # ==================== PROGRESSO ====================
-    def _update_progress(self, percent, text):
+    def _update_progress(self, job_id, percent, text):
+        """Atualiza a barra de progresso e status do job específico."""
+        job = self._active_jobs.get(job_id, {})
         if percent is not None:
             try:
                 val = max(0.0, min(1.0, float(percent)))
                 self.progress.set(val)
-                if getattr(self, "_active_dl_progress", None):
-                    self._active_dl_progress.set(val)
+                bar = job.get("progress_bar")
+                if bar:
+                    bar.set(val)
             except (TypeError, ValueError):
                 pass
         if text:
             self.set_status(text)
-            if getattr(self, "_active_dl_status", None):
-                self._active_dl_status.configure(text=text)
+            try:
+                lbl = job.get("status_lbl")
+                if lbl:
+                    lbl.configure(text=text)
+            except Exception:
+                pass
 
     def cancel_download(self):
-        if not self.is_downloading:
-            return
-        self.cancel_event.set()
+        """Cancela todos os jobs ativos (botão global da barra de opções)."""
+        for job_id in list(self._active_jobs.keys()):
+            self._cancel_job(job_id)
         self.cancel_btn.configure(state="disabled", text="Cancelando...")
         self.set_status("Cancelando, aguarde...")
+
+    def _cancel_job(self, job_id):
+        """Cancela um job individual pelo seu ID."""
+        job = self._active_jobs.get(job_id)
+        if job:
+            job["cancel_event"].set()
+            # Atualiza o status do widget deste job
+            try:
+                lbl = job.get("status_lbl")
+                if lbl:
+                    lbl.configure(text="Cancelando...")
+            except Exception:
+                pass
 
     def _analysis_failed(self, message):
         self.finish_download(None)
@@ -1388,11 +1453,6 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
 
     # ==================== EXECUÇÃO ====================
     def proceed_with(self, items):
-        if self.cancel_event.is_set():
-            self._pending_items = None
-            self.finish_download("Download cancelado")
-            return
-
         flagged = self.check_duplicates(items)
         overwrite = False
 
@@ -1425,44 +1485,72 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         self.start_download_thread(items, overwrite)
 
     def start_download_thread(self, items, overwrite):
-        # captura as escolhas na thread principal: as threads worker do
-        # yt-dlp não podem ler variáveis do Tk (RuntimeError)
-        self._mode = self.download_type.get()
-        self._quality = self.quality_menu.get()
-        self._pending_items = items
-        self.overwrite = overwrite
+        """Cria um novo job independente e dispara a thread de download."""
+        # Captura as escolhas AGORA na thread principal (as threads worker
+        # do yt-dlp não podem ler variáveis do Tk)
+        mode = self.download_type.get()
+        quality = self.quality_menu.get()
+        target_dir = self._target_dir
+        self._pending_items = None
         self._download_started = True
-        self.logger = YDLLogger()
-        total = len(items)
-        self.set_download_button(
-            "Baixando..." if total == 1 else f"Baixando 1/{total}...",
-            disabled=True
-        )
-        threading.Thread(target=self.download_thread, daemon=True).start()
 
-    def _on_item_start(self, index, total, title):
+        # Cria um job com contexto independente
+        job_id = self._next_job_id
+        self._next_job_id += 1
+        cancel_event = threading.Event()
+        logger = YDLLogger()
+
+        self._active_jobs[job_id] = {
+            "cancel_event": cancel_event,
+            "logger": logger,
+            "mode": mode,
+            "quality": quality,
+            "target_dir": target_dir,
+            "overwrite": overwrite,
+            "frame": None,
+            "status_lbl": None,
+            "progress_bar": None,
+            "current_file": None,
+        }
+
+        # Cria o widget de progresso com o título do primeiro item
+        first_title = items[0]["title"] if items else "Download"
+        self.add_active_download(job_id, first_title, mode)
+
+        # Reabilita o botão para permitir novos downloads simultâneos
+        self.set_download_button(BTN_DOWNLOAD, disabled=False)
+        self._update_cancel_btn()
+
+        threading.Thread(
+            target=self._download_job_thread,
+            args=(job_id, items),
+            daemon=True
+        ).start()
+
+    def _on_item_start(self, job_id, index, total, title):
         short = title if len(title) <= 50 else title[:47] + "..."
         self.progress.set(0)
-        self.set_download_button(
-            "Baixando..." if total == 1 else f"Baixando {index}/{total}...",
-            disabled=True
-        )
         self.set_status(f"[{index}/{total}] {short}")
-        
-        self.remove_active_download()
-        self.add_active_download(title, self._mode)
 
-    def _on_download_done(self, completed, failed, cancelled, total):
-        self.remove_active_download()
-        for entry in completed:
-            self.add_history_item(entry)
+        job = self._active_jobs.get(job_id, {})
+        # Atualiza o título do widget de progresso deste job
+        try:
+            lbl = job.get("status_lbl")
+            if lbl:
+                prog_text = "Baixando..." if total == 1 else f"[{index}/{total}] {short}"
+                lbl.configure(text=prog_text)
+            bar = job.get("progress_bar")
+            if bar:
+                bar.set(0)
+                bar.configure(progress_color=C_ACCENT)
+        except Exception:
+            pass
 
-        if cancelled:
-            if completed:
-                self.finish_download(f"Download cancelado ({len(completed)}/{total} concluídos)")
-            else:
-                self.finish_download("Download cancelado")
-            return
+    def _on_download_done(self, job_id, completed, failed, cancelled, total):
+        self.remove_active_download(job_id)
+
+        # Atualiza o botão cancelar global baseado em jobs ainda ativos
+        self._update_cancel_btn()
 
         def problems():
             lines = []
@@ -1475,36 +1563,38 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
                 lines.append(f"... e mais {len(failed) - 10} erro(s)")
             return "\n".join(lines)
 
-        if failed and not completed:
-            self.finish_download("Erro no download")
+        if cancelled and not completed:
+            self.set_status("Download cancelado")
+        elif failed and not completed:
+            self.set_status("Erro no download")
             messagebox.showerror("Erro", f"Nenhum arquivo foi baixado:\n\n{problems()}", parent=self)
         elif failed:
-            self.finish_download(f"Concluído com {len(failed)} erro(s)")
+            self.set_status(f"Concluído com {len(failed)} erro(s)")
             messagebox.showwarning(
                 "Concluído com erros",
                 f"{len(completed)} baixado(s) e {len(failed)} falha(s):\n\n{problems()}",
                 parent=self
             )
+        elif cancelled:
+            self.set_status(f"Cancelado ({len(completed)}/{total} concluídos)")
         else:
-            self.finish_download("Download finalizado!")
+            self.set_status("Download finalizado!")
             if len(completed) == 1:
                 messagebox.showinfo("Sucesso", "Download concluído com sucesso!", parent=self)
             else:
                 messagebox.showinfo("Sucesso", f"{len(completed)} arquivo(s) baixado(s) com sucesso!", parent=self)
 
     def finish_download(self, status=None):
-        self.remove_active_download()
-        self.is_downloading = False
+        """Finaliza a fase de análise (antes de criar um job). Sempre reabilita o botão."""
         self._pending_items = None
         self.set_download_button(BTN_DOWNLOAD, disabled=False)
-        self.cancel_btn.configure(state="disabled", text=BTN_CANCEL)
+        self._update_cancel_btn()
         self.progress.set(0)
         self.progress.configure(progress_color=C_ACCENT)
         if status:
             self.set_status(status)
 
-        # Se o download nem começou (link inválido, playlist cancelada,
-        # duplicado recusado...), devolve o link para o campo.
+        # Se o download nem começou, devolve o link para o campo
         if not self._download_started and self._last_url:
             try:
                 if not self.url_entry.get().strip():
@@ -1513,7 +1603,218 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
                 pass
         self._last_url = ""
 
-    # ==================== OPÇÕES DO yt-dlp ====================
+    def _update_cancel_btn(self):
+        """Atualiza estado do botão Cancelar baseado nos jobs ativos."""
+        if self._active_jobs:
+            self.cancel_btn.configure(state="normal", text=BTN_CANCEL)
+        else:
+            self.cancel_btn.configure(state="disabled", text=BTN_CANCEL)
+
+    # ==================== THREAD DE DOWNLOAD (por job) ====================
+    def _download_job_thread(self, job_id, items):
+        """Thread de download independente por job_id."""
+        job = self._active_jobs.get(job_id)
+        if not job:
+            return
+
+        cancel_event = job["cancel_event"]
+        logger = job["logger"]
+        mode = job["mode"]
+        quality = job["quality"]
+        target_dir = job["target_dir"]
+        overwrite = job["overwrite"]
+        total = len(items)
+        completed, failed = [], []
+
+        def progress_hook(d):
+            filename = d.get("filename")
+            if filename:
+                if job_id in self._active_jobs:
+                    self._active_jobs[job_id]["current_file"] = filename
+
+            status = d.get("status")
+            if status == "downloading" and cancel_event.is_set():
+                raise DownloadCancelled("Download cancelado pelo usuário")
+
+            if status == "downloading":
+                now = time.monotonic()
+                if now - job.get("_last_hook", 0) < 0.2:
+                    return
+                job["_last_hook"] = now
+                
+                # Remove códigos ANSI que o yt-dlp pode injetar na string de progresso
+                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                p_str = ansi_escape.sub('', str(d.get("_percent_str", "0"))).strip()
+                s_str = ansi_escape.sub('', str(d.get("_speed_str", "N/A"))).strip()
+                e_str = ansi_escape.sub('', str(d.get("_eta_str", "N/A"))).strip()
+                
+                try:
+                    percent = float(p_str.replace("%", "")) / 100
+                except ValueError:
+                    percent = None
+                text = f"Baixando... {p_str} | Velocidade: {s_str} | ETA: {e_str}"
+                self.ui(self._update_progress, job_id, percent, text)
+            elif status == "finished":
+                self.ui(self._update_progress, job_id, 1, "Processando arquivo...")
+
+        # Monta as opções do yt-dlp usando o contexto deste job
+        outtmpl = os.path.join(target_dir, "%(title)s.%(ext)s")
+        opts = {
+            "outtmpl": outtmpl,
+            "progress_hooks": [progress_hook],
+            "quiet": True,
+            "no_warnings": True,
+            "logger": logger,
+            "ignoreerrors": True,
+            "noplaylist": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "noprogress": True,
+            "overwrites": overwrite,
+            "color": "no_color",
+        }
+        if self.ffmpeg_location:
+            opts["ffmpeg_location"] = self.ffmpeg_location
+
+        if mode == "audio":
+            kbps_match = re.search(r"(\d+)\s*kbps", quality, re.IGNORECASE)
+            kbps = kbps_match.group(1) if kbps_match else "192"
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": kbps,
+            }]
+        else:
+            h_match = re.search(r"(\d+)p", quality)
+            if h_match:
+                height = h_match.group(1)
+                opts["format"] = (
+                    f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={height}]+bestaudio/"
+                    f"bestvideo[height<={height}]/best"
+                )
+            else:
+                opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+            opts["postprocessors"] = [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}]
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                for index, item in enumerate(items, 1):
+                    if cancel_event.is_set():
+                        break
+
+                    if job_id in self._active_jobs:
+                        self._active_jobs[job_id]["current_file"] = None
+                    logger.reset()
+                    self.ui(self._on_item_start, job_id, index, total, item["title"])
+
+                    try:
+                        info = ydl.extract_info(item["url"], download=True)
+                    except DownloadCancelled:
+                        break
+                    except Exception as e:
+                        if cancel_event.is_set():
+                            break
+                        failed.append({
+                            "title": item["title"],
+                            "error": logger.last_error() or str(e) or "erro desconhecido",
+                        })
+                        continue
+
+                    if cancel_event.is_set():
+                        break
+
+                    if info is None:
+                        failed.append({
+                            "title": item["title"],
+                            "error": logger.last_error() or "link indisponível",
+                        })
+                        continue
+
+                    final_file = self._resolve_file(info, item, target_dir, mode)
+                    if final_file is None:
+                        failed.append({
+                            "title": item["title"],
+                            "error": "arquivo não encontrado na pasta de destino",
+                        })
+                        continue
+
+                    entry = {
+                        "title": info.get("title") or item["title"],
+                        "folder": str(Path(final_file).parent),
+                        "filepath": final_file,
+                        "url": item["url"],
+                        "kind": mode,
+                        "date": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    }
+                    completed.append(entry)
+                    # Adiciona ao histórico progressivamente assim que o item termina
+                    self.ui(self.add_history_item, entry)
+        except Exception as e:
+            if not cancel_event.is_set():
+                failed.append({"title": "Download", "error": str(e)})
+        finally:
+            if cancel_event.is_set():
+                self._cleanup_job_partial(job_id)
+
+        cancelled = cancel_event.is_set()
+        self.ui(self._on_download_done, job_id, completed, failed, cancelled, total)
+
+    def _resolve_file(self, info, item, target_dir, mode):
+        """Localiza o arquivo final gerado pelo yt-dlp (versão por job)."""
+        folder = Path(target_dir)
+        prefer = "mp3" if mode == "audio" else "mp4"
+        stem = sanitize_filename(info.get("title") or item["title"])
+
+        candidates = []
+        filepath = info.get("filepath")
+        if filepath:
+            candidates.append(filepath)
+        candidates.append(str(folder / f"{stem}.{prefer}"))
+        for ext in ("mp3", "mp4", "m4a", "webm", "mkv", "opus", "ogg", "aac"):
+            candidates.append(str(folder / f"{stem}.{ext}"))
+
+        for candidate in candidates:
+            try:
+                if os.path.isfile(candidate):
+                    return candidate
+            except OSError:
+                continue
+
+        try:
+            lower_stem = stem.lower()
+            for file in folder.iterdir():
+                if file.is_file() and file.stem.lower() == lower_stem:
+                    return str(file)
+        except OSError:
+            pass
+        return None
+
+    def _cleanup_job_partial(self, job_id):
+        """Remove arquivos .part / .ytdl de um job cancelado."""
+        job = self._active_jobs.get(job_id, {})
+        current = job.get("current_file")
+        if not current:
+            return
+        folder = Path(current).parent
+        base = Path(current).name
+        try:
+            for file in folder.iterdir():
+                if not file.is_file():
+                    continue
+                name = file.name
+                if name == base:
+                    continue
+                if name.startswith(base + ".part") or name.startswith(base + ".ytdl"):
+                    try:
+                        file.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    # ==================== MÉTODOS LEGADOS (mantidos por compatibilidade) ====================
     def get_ydl_opts(self, logger):
         outtmpl = os.path.join(self._target_dir, "%(title)s.%(ext)s")
 
@@ -1591,26 +1892,8 @@ class LDYouTubeDownloader(ctk.CTk, PlayerMixin, ConverterMixin, DownloaderMixin)
         return None
 
     def cleanup_partial(self):
-        """Remove arquivos .part / .ytdl deixados por um download cancelado."""
-        current = self.current_file
-        if not current:
-            return
-        folder = Path(current).parent
-        base = Path(current).name
-        try:
-            for file in folder.iterdir():
-                if not file.is_file():
-                    continue
-                name = file.name
-                if name == base:
-                    continue
-                if name.startswith(base + ".part") or name.startswith(base + ".ytdl"):
-                    try:
-                        file.unlink()
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        """Legado: limpeza de parciais agora é feita por _cleanup_job_partial."""
+        pass
 
 
 if __name__ == "__main__":

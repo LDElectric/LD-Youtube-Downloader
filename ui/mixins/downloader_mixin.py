@@ -1,4 +1,5 @@
 import os, time, threading, re, shutil, urllib.request, zipfile, json, ctypes, sys
+from datetime import datetime
 from pathlib import Path
 import yt_dlp
 from yt_dlp.utils import DownloadCancelled
@@ -6,38 +7,8 @@ from core.config import *
 from core.logger import YDLLogger
 
 class DownloaderMixin:
-    def progress_hook(self, d):
-        filename = d.get("filename")
-        if filename:
-            self.current_file = filename
-
-        status = d.get("status")
-
-        # Cancelamento: interrompe o download atual
-        if status == "downloading" and self.cancel_event.is_set():
-            raise DownloadCancelled("Download cancelado pelo usuário")
-
-        if status == "downloading":
-            now = time.monotonic()
-            if now - self._last_hook_ui < 0.2:
-                return
-            self._last_hook_ui = now
-            try:
-                percent = float(str(d.get("_percent_str", "0")).replace("%", "").strip() or 0) / 100
-            except ValueError:
-                percent = None
-            speed = d.get("_speed_str", "N/A")
-            eta = d.get("_eta_str", "N/A")
-            text = f"Baixando... {d.get('_percent_str', '')} | Velocidade: {speed} | ETA: {eta}"
-            self.ui(self._update_progress, percent, text)
-        elif status == "finished":
-            self.ui(self._update_progress, 1, "Processando arquivo...")
-
     # ==================== FLUXO DE DOWNLOAD ====================
     def start_download(self):
-        if self.is_downloading:
-            return
-
         url = self.url_entry.get().strip()
         if not url:
             messagebox.showwarning("Aviso", "Cole um link válido do YouTube.", parent=self)
@@ -49,13 +20,8 @@ class DownloaderMixin:
         self._target_dir = self.download_path
         self._last_url = url
         self._download_started = False
-        self.is_downloading = True
-        self.cancel_event.clear()
-        self._pending_items = None
-        self.current_file = None
 
         self.set_download_button("Analisando link...", disabled=True)
-        self.cancel_btn.configure(state="normal", text=BTN_CANCEL)
         self.progress.set(0)
         self.progress.configure(progress_color=C_ACCENT)
         self.set_status("Obtendo informações do link...")
@@ -78,10 +44,6 @@ class DownloaderMixin:
 
         if not info:
             self.ui(self._analysis_failed, "Não foi possível obter informações do link.")
-            return
-
-        if self.cancel_event.is_set():
-            self.ui(self.finish_download, "Download cancelado")
             return
 
         self.ui(self.handle_analysis, info, url)
@@ -131,8 +93,6 @@ class DownloaderMixin:
                 done = 0
                 with open(zip_path, "wb") as fh:
                     while True:
-                        if self.cancel_event.is_set():
-                            raise DownloadCancelled("Download cancelado pelo usuário")
                         chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
@@ -163,14 +123,6 @@ class DownloaderMixin:
             save_config(self.app_config)
             self.ffmpeg_location = str(target_dir)
             self.ui(self._ffmpeg_done)
-        except DownloadCancelled:
-            if zip_path:
-                try:
-                    zip_path.unlink()
-                except OSError:
-                    pass
-            self._pending_items = None
-            self.ui(self.finish_download, "Download cancelado")
         except Exception as e:
             if zip_path:
                 try:
@@ -178,71 +130,3 @@ class DownloaderMixin:
                 except OSError:
                     pass
             self.ui(self._ffmpeg_failed, str(e))
-
-    def download_thread(self):
-        items = self._pending_items or []
-        self._pending_items = None
-        total = len(items)
-        completed, failed = [], []
-        logger = self.logger
-
-        try:
-            opts = self.get_ydl_opts(logger)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                for index, item in enumerate(items, 1):
-                    if self.cancel_event.is_set():
-                        break
-
-                    self.current_file = None
-                    logger.reset()
-                    self.ui(self._on_item_start, index, total, item["title"])
-
-                    try:
-                        info = ydl.extract_info(item["url"], download=True)
-                    except DownloadCancelled:
-                        break
-                    except Exception as e:
-                        if self.cancel_event.is_set():
-                            break
-                        failed.append({
-                            "title": item["title"],
-                            "error": logger.last_error() or str(e) or "erro desconhecido",
-                        })
-                        continue
-
-                    if self.cancel_event.is_set():
-                        break
-
-                    if info is None:
-                        failed.append({
-                            "title": item["title"],
-                            "error": logger.last_error() or "link indisponível",
-                        })
-                        continue
-
-                    final_file = self.resolve_final_file(info, item)
-                    if final_file is None:
-                        failed.append({
-                            "title": item["title"],
-                            "error": "arquivo não encontrado na pasta de destino",
-                        })
-                        continue
-
-                    completed.append({
-                        "title": info.get("title") or item["title"],
-                        "folder": str(Path(final_file).parent),
-                        "filepath": final_file,
-                        "url": item["url"],
-                        "kind": self._mode,
-                        "date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                    })
-        except Exception as e:
-            if not self.cancel_event.is_set():
-                failed.append({"title": "Download", "error": str(e)})
-        finally:
-            if self.cancel_event.is_set():
-                self.cleanup_partial()
-
-        cancelled = self.cancel_event.is_set()
-        self.ui(self._on_download_done, completed, failed, cancelled, total)
-
